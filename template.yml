@@ -1,0 +1,211 @@
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  Repository:
+    Type: AWS::ECR::PublicRepository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName: codebuild/standard
+      RepositoryCatalogData:
+        Architectures: [x86-64]
+        OperatingSystems: [Linux]
+        RepositoryDescription: An unofficial source of pre-cached CodeBuild base images
+        UsageText: |
+          There are at least three ways you could use these images.
+          
+          ## By major version
+          
+          The first is the simplest: have your image specify a major version (e.g. 7.0) as its
+          base image. This means that whenever AWS publishes a new minor version, all you need
+          to do is rebuild your Docker image (be sure to run `docker build --pull` to avoid using
+          a cached older version) and it will just work. That looks like this:
+          
+          ```
+          FROM public.ecr.aws/aidansteele/codebuild/standard:7.0
+          RUN echo 'hello world' > /etc/example.txt
+          ```
+          
+          ## By minor version
+          
+          The second option is to specify a minor version, e.g. instead of the image tagged `7.0` you
+          use the image tagged `7.0-1.0.879`. Unfortunately these don't yet correspond to the minor
+          versions returned by the CodeBuild API - that's on my to-do list. This helps ensure that
+          your build won't break if it's sensitive to minor changes in the CodeBuild environment.
+          
+          ## By image digest
+          
+          The third option is good for the paranoid. You can specify an image digest as your base
+          layer. This means you don't need to worry about trusting me personally. You can download the
+          image, verify it offline and only refer to it by its digest from that point on. For example,
+          it would look like:
+          
+          ```
+          FROM public.ecr.aws/aidansteele/codebuild/standard@sha256:03b50df76cee719540ed8941b49d4e062cf9b7a0b2084acf19a1f6eba87774b4
+          RUN echo 'hello world' > /etc/example.txt
+          ```
+        AboutText: |
+          # A completely unofficial source of CodeBuild Docker images
+
+          AWS CodeBuild has two features that are both super useful:
+            
+          * [Curated images](https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-available.html) with
+            a **lot** of useful software pre-installed.
+          * Custom images: the ability to specify your own Docker image to use as your
+            build environment.
+          
+          Unfortunately, where it falls down is _combining_ these two features. If you want
+          to customise one of the curated images, you _can_ because AWS provides the [Dockerfiles](https://github.com/aws/aws-codebuild-docker-images)
+          used to build those images. But you won't want to, for a few reasons:
+          
+          * Building `aws/codebuild/standard:4.0` takes 25 minutes on a `general1.large`
+          * Running a build job on CodeBuild using that custom image takes about 350 seconds
+          on a `general1.small`. That's about five and a half minutes more than the usual
+          20-something seconds. Massive overhead!
+          
+          The second issue is because CodeBuild has to download your ~3.7GB image and decompress
+          it to ~8.7GB. It has to do all that because your image doesn't share any Docker image
+          _layers_ with the curated images.
+          
+          ## Solution
+          
+          The solution is to build your custom image and have your Dockerfile build on
+          top of the curated image's layers. AWS doesn't publish these, so I did it myself.
+          More information is available on the usage tab of the ECR Public Gallery listing, but 
+          you can use them like so:
+          
+          ```
+          FROM public.ecr.aws/aidansteele/codebuild/standard:7.0
+          RUN echo 'hello world' > /etc/example.txt
+          ```
+          
+          You can then publish that image to ECR, Docker Hub, anywhere you want. You'll
+          still have to upload (and pay for on ECR) ~4GB to store the entire image, but
+          when CodeBuild runs your custom image it will incur essentially no overhead.
+          
+          ## How?
+          
+          This image is extracted from the CodeBuild environment by "escaping" the CodeBuild
+          environment, retagging the images and pushing them to the ECR Public Gallery. The process
+          runs once a day (so that Amazon's changes are automatically reflected in this repo)
+          and is open source: see the [GitHub repo](https://github.com/aidansteele/codebuild)
+          for more details.
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            exported-variables:
+              - IMAGES
+          phases:
+            build:
+              commands:
+                - mkdir /host && mount /dev/nvme0n1p1 /host
+                - apt-get update && apt-get install -y psmisc
+                - killall -w dockerd
+                - rm -rf /var/lib/docker/image
+                - rm -rf /var/lib/docker/overlay2
+                - ln -s /host/var/lib/docker/image /var/lib/docker/image
+                - ln -s /host/var/lib/docker/overlay2 /var/lib/docker/overlay2
+                - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 --storage-driver=overlay2 &
+                - timeout 45 sh -c "until docker info; do echo .; sleep 1; done"
+                - export IMAGES=$(docker images --format=json)
+                - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/aidansteele
+                - retag=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format "docker tag {{.ID}} public.ecr.aws/aidansteele/codebuild/standard:{{.Tag}};")
+                - eval $retag
+                - push=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format "docker push public.ecr.aws/aidansteele/codebuild/standard:{{.Tag}};") 
+                - eval $push
+                - retag=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format 'docker tag {{.ID}} public.ecr.aws/aidansteele/codebuild/standard:{{printf "%.3s" .Tag}};')
+                - eval $retag
+                - push=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format 'docker push public.ecr.aws/aidansteele/codebuild/standard:{{printf "%.3s" .Tag}};') 
+                - eval $push
+#                - export userVisibleTag=$(echo $CODEBUILD_BUILD_IMAGE | awk '-F:' '{print $2}')
+#                - export majorVersion=$(echo $userVisibleTag | awk -F- '{print $1}')
+#                - export imageSha=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard:${majorVersion} --format "{{.ID}}")
+#                - docker tag $imageSha public.ecr.aws/aidansteele/codebuild/standard:$userVisibleTag
+#                - docker push public.ecr.aws/aidansteele/codebuild/standard:$userVisibleTag
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: codebuild.amazonaws.com
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr-public:GetAuthorizationToken
+                  - ecr-public:BatchCheckLayerAvailability
+                  - ecr-public:GetRepositoryPolicy
+                  - ecr-public:DescribeImages
+                  - ecr-public:InitiateLayerUpload
+                  - ecr-public:UploadLayerPart
+                  - ecr-public:CompleteLayerUpload
+                  - ecr-public:PutImage
+                Resource: "*"
+              - Effect: Allow
+                Action: sts:GetServiceBearerToken
+                Resource: "*"
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/codebuild/*
+                  - !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/codebuild/*:*
+
+  StateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Ref AWS::StackName
+      Type: STANDARD
+      AutoPublishAlias: live
+      UseAliasAsEventTarget: true
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: Run build
+        States:
+          Run build:
+            Type: Task
+            Resource: arn:aws:states:::codebuild:startBuild.sync
+            Arguments:
+              ProjectName: !Ref CodeBuildProject
+            End: true
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: 'cron(0 12 * * ? *)'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - codebuild:StartBuild
+                - codebuild:StopBuild
+                - codebuild:BatchGetBuilds
+              Resource: !GetAtt CodeBuildProject.Arn
+            - Effect: Allow
+              Action:
+                - events:PutTargets
+                - events:PutRule
+                - events:DescribeRule
+              Resource: arn:aws:events:*:*:rule/StepFunctionsGetEventForCodeBuildStartBuildRule
