@@ -28,9 +28,9 @@ Resources:
           ## By minor version
           
           The second option is to specify a minor version, e.g. instead of the image tagged `7.0` you
-          use the image tagged `7.0-1.0.879`. Unfortunately these don't yet correspond to the minor
-          versions returned by the CodeBuild API - that's on my to-do list. This helps ensure that
-          your build won't break if it's sensitive to minor changes in the CodeBuild environment.
+          use the image tagged `7.0-26.01.16`. These correspond to the versions returned by the
+          `codebuild:ListCuratedEnvironmentImages` API. This helps ensure that your build won't
+          break if it's sensitive to minor changes in the CodeBuild environment.
           
           ## By image digest
           
@@ -122,19 +122,40 @@ Resources:
                 - timeout 45 sh -c "until docker info; do echo .; sleep 1; done"
                 - export IMAGES=$(docker images --format=json)
                 - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/aidansteele
-                - retag=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format "docker tag {{.ID}} public.ecr.aws/aidansteele/codebuild/standard:{{.Tag}};")
-                - eval $retag
-                - push=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format "docker push public.ecr.aws/aidansteele/codebuild/standard:{{.Tag}};") 
-                - eval $push
-                - retag=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format 'docker tag {{.ID}} public.ecr.aws/aidansteele/codebuild/standard:{{printf "%.3s" .Tag}};')
-                - eval $retag
-                - push=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format 'docker push public.ecr.aws/aidansteele/codebuild/standard:{{printf "%.3s" .Tag}};') 
-                - eval $push
-#                - export userVisibleTag=$(echo $CODEBUILD_BUILD_IMAGE | awk '-F:' '{print $2}')
-#                - export majorVersion=$(echo $userVisibleTag | awk -F- '{print $1}')
-#                - export imageSha=$(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard:${majorVersion} --format "{{.ID}}")
-#                - docker tag $imageSha public.ecr.aws/aidansteele/codebuild/standard:$userVisibleTag
-#                - docker push public.ecr.aws/aidansteele/codebuild/standard:$userVisibleTag
+                # Fetch user-visible versions from the CodeBuild API
+                - aws codebuild list-curated-environment-images --query "platforms[].languages[].images[?starts_with(name, 'aws/codebuild/standard:')].[name, versions[-1]][]" --output text > /tmp/curated-versions.txt
+                - cat /tmp/curated-versions.txt
+                # Get existing tags in ECR so we can avoid overwriting immutable version tags
+                - aws ecr-public describe-images --repository-name codebuild/standard --region us-east-1 --query 'imageDetails[].imageTags[]' --output text | tr '\t' '\n' | sort -u > /tmp/existing-tags.txt
+                # Loop over all standard images on the host
+                - |
+                    for INTERNAL_TAG in $(docker images --filter reference=288275683263.dkr.ecr.us-west-2.amazonaws.com/standard --format "{{.Tag}}"); do
+                      MAJOR=$(echo "$INTERNAL_TAG" | awk -F- '{print $1}')
+                      IMAGE_ID=$(docker images --format "{{.ID}}" "288275683263.dkr.ecr.us-west-2.amazonaws.com/standard:$INTERNAL_TAG")
+                      API_VERSION=$(grep "aws/codebuild/standard:${MAJOR}" /tmp/curated-versions.txt | awk '{print $2}' | awk -F: '{print $2}')
+                      echo "Internal tag=$INTERNAL_TAG Major=$MAJOR API_VERSION=$API_VERSION Image=$IMAGE_ID"
+
+                      # Always push the internal tag as an immutable ground-truth reference
+                      docker tag "$IMAGE_ID" "public.ecr.aws/aidansteele/codebuild/standard:$INTERNAL_TAG"
+                      docker push "public.ecr.aws/aidansteele/codebuild/standard:$INTERNAL_TAG"
+
+                      # Always update the mutable major version pointer (e.g. 7.0)
+                      docker tag "$IMAGE_ID" "public.ecr.aws/aidansteele/codebuild/standard:$MAJOR"
+                      docker push "public.ecr.aws/aidansteele/codebuild/standard:$MAJOR"
+
+                      # Only create user-visible version tag if it doesn't already exist (write-once)
+                      if [ -n "$API_VERSION" ]; then
+                        if grep -qx "$API_VERSION" /tmp/existing-tags.txt; then
+                          echo "User-visible tag $API_VERSION already exists, skipping"
+                        else
+                          echo "Creating new user-visible tag $API_VERSION"
+                          docker tag "$IMAGE_ID" "public.ecr.aws/aidansteele/codebuild/standard:$API_VERSION"
+                          docker push "public.ecr.aws/aidansteele/codebuild/standard:$API_VERSION"
+                        fi
+                      else
+                        echo "Warning: no API version found for major version $MAJOR, skipping versioned tag"
+                      fi
+                    done
 
   CodeBuildRole:
     Type: AWS::IAM::Role
@@ -163,6 +184,9 @@ Resources:
                 Resource: "*"
               - Effect: Allow
                 Action: sts:GetServiceBearerToken
+                Resource: "*"
+              - Effect: Allow
+                Action: codebuild:ListCuratedEnvironmentImages
                 Resource: "*"
               - Action:
                   - logs:CreateLogGroup
